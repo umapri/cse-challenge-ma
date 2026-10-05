@@ -1,0 +1,177 @@
+# .github/workflows/fossa.yml
+# FOSSA scan for the FlipFlop x StepToes AI M&A diligence (fossas/cse-challenge-ma).
+# One FOSSA project per product directory, as the brief requires (`fossa analyze <dir> --project <name>`).
+#
+# Setup (once):
+#   Secret   FOSSA_API_KEY           full-access key for the diligence org (Settings > Secrets and variables > Actions)
+#   Variable FOSSA_RELEASE_GROUP     optional, existing release group name, e.g. "StepToes AI Diligence"
+#   Variable FOSSA_RELEASE           optional, release within that group, e.g. "2026-10-baseline"
+#   Variable FOSSA_POLICY_DISTRIBUTED / FOSSA_POLICY_HOSTED   optional, existing FOSSA policy names
+#   Variable FOSSA_TEAM              optional, existing FOSSA team, e.g. "M&A - StepToes AI"
+# Empty variables are skipped, so the workflow runs before any of them exist.
+
+name: FOSSA diligence scan
+
+on:
+  push:
+    branches: [main]            # baseline on the default branch; later PRs diff against it
+  pull_request:                 # remediation PRs show exactly what they fix or introduce
+  schedule:
+    - cron: "17 6 * * 1"        # weekly re-scan: new CVEs appear without code changes
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: "Fail the run when FOSSA policy issues are found"
+        type: boolean
+        default: false          # diligence = report everything, block nothing
+
+permissions:
+  contents: read                # least privilege; FOSSA needs nothing from GITHUB_TOKEN
+
+concurrency:
+  group: fossa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Report-only by default. Set ENFORCE to true (or use the manual input) to turn the scan into a gate.
+  ENFORCE: ${{ github.event.inputs.enforce || 'false' }}
+
+jobs:
+  fossa:
+    name: ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false          # one product's findings never cancel the other product's scan
+      matrix:
+        include:
+          - dir: distributed-python-based-product
+            project: steptoes-distributed-python
+            title: "StepToes AI - Distributed (Python)"
+            label: distributed
+            policy_var: FOSSA_POLICY_DISTRIBUTED
+          - dir: nondistributed-javascript-based-product
+            project: steptoes-nondistributed-js
+            title: "StepToes AI - Non-distributed (JavaScript)"
+            label: non-distributed
+            policy_var: FOSSA_POLICY_HOSTED
+    env:
+      FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+      DIR: ${{ matrix.dir }}
+      PROJECT: ${{ matrix.project }}
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+      REV: ${{ github.sha }}
+      POLICY: ${{ vars[matrix.policy_var] }}
+      TEAM: ${{ vars.FOSSA_TEAM }}
+      RELEASE_GROUP: ${{ vars.FOSSA_RELEASE_GROUP }}
+      RELEASE: ${{ vars.FOSSA_RELEASE }}
+      OUT: fossa-out
+    defaults:
+      run:
+        shell: bash             # GitHub adds -o pipefail, so `| tee` cannot hide a failure
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check FOSSA secret
+        run: |
+          if [ -z "$FOSSA_API_KEY" ]; then
+            echo "::error title=FOSSA_API_KEY missing::Add it as a repository secret. PRs from forks do not receive secrets."
+            exit 1
+          fi
+          mkdir -p "$OUT"
+
+      - name: Install FOSSA CLI
+        run: |
+          curl -fsSL -H 'Cache-Control: no-cache' \
+            https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
+          fossa --version | tee "$OUT/fossa-version.txt"
+
+      - name: List targets in ${{ matrix.dir }}
+        run: fossa list-targets "$DIR" | tee "$OUT/targets.txt"
+
+      - name: Analyze ${{ matrix.dir }} as ${{ matrix.project }}
+        id: analyze
+        run: |
+          args=(
+            "$DIR"
+            --project "$PROJECT"
+            --revision "$REV"
+            --branch "$BRANCH"
+            --title "${{ matrix.title }}"
+            --project-label "${{ matrix.label }}"
+            --project-label m-and-a
+            --json
+          )
+          [ -n "$POLICY" ] && args+=(--policy "$POLICY")
+          [ -n "$TEAM" ] && args+=(--team "$TEAM")
+          if [ -n "$RELEASE_GROUP" ] && [ -n "$RELEASE" ]; then
+            args+=(--release-group-name "$RELEASE_GROUP" --release-group-release "$RELEASE")
+          fi
+          [ -n "${RUNNER_DEBUG:-}" ] && args+=(--debug)   # "Re-run with debug logging" adds a debug bundle
+          fossa analyze "${args[@]}" | tee "$OUT/analyze.json"
+
+      # --project on every later command: there is no .fossa.yml, so without it the CLI
+      # would guess a project name from the git remote and look up the wrong project.
+      - name: Policy test
+        id: test
+        continue-on-error: ${{ env.ENFORCE != 'true' }}
+        run: |
+          fossa test --project "$PROJECT" --revision "$REV" 2>&1 | tee "$OUT/test.txt"
+
+      - name: Policy results (JSON)
+        if: always() && steps.analyze.outcome == 'success'
+        run: fossa test --project "$PROJECT" --revision "$REV" --format json > "$OUT/test.json" || true
+
+      - name: Reports (attribution, SBOMs, inventory)
+        id: reports
+        if: always() && steps.analyze.outcome == 'success'
+        continue-on-error: true   # a report hiccup never fails the scan
+        run: |
+          r() { fossa report attribution --project "$PROJECT" --revision "$REV" --timeout 600 --format "$1" > "$OUT/$2"; }
+          r html           attribution.html
+          r text           THIRD_PARTY_NOTICES.txt
+          r cyclonedx-json sbom.cdx.json
+          r spdx-json      sbom.spdx.json
+          r csv            inventory.csv
+
+      - name: Job summary
+        if: always()
+        run: |
+          url=$(jq -r '.url // empty' "$OUT/analyze.json" 2>/dev/null || true)
+          {
+            echo "## ${{ matrix.title }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Directory | \`$DIR\` |"
+            echo "| FOSSA project | \`$PROJECT\` |"
+            echo "| Revision | \`${REV:0:7}\` on \`$BRANCH\` |"
+            echo "| Policy | ${POLICY:-org default} |"
+            echo "| Analyze | ${{ steps.analyze.outcome }} |"
+            echo "| Policy test | ${{ steps.test.outcome }} (enforce: $ENFORCE) |"
+            echo "| Reports | ${{ steps.reports.outcome }} |"
+            echo
+            [ -n "$url" ] && echo "Results in FOSSA: $url" && echo
+            echo "<details><summary>fossa test output</summary>"
+            echo
+            echo '```'
+            cat "$OUT/test.txt" 2>/dev/null || echo "fossa test did not run."
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.test.outcome }}" = "failure" ]; then
+            echo "::warning title=FOSSA policy issues in $PROJECT::See the job summary and the FOSSA Issues tab."
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossa-${{ matrix.project }}-${{ github.run_id }}
+          path: |
+            ${{ env.OUT }}/
+            fossa.debug.*
+          if-no-files-found: ignore
+          retention-days: 30
