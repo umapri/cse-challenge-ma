@@ -2,13 +2,18 @@
 # FOSSA scan for the FlipFlop x StepToes AI M&A diligence (fossas/cse-challenge-ma).
 # One FOSSA project per product directory, as the brief requires (`fossa analyze <dir> --project <name>`).
 #
+# Licensing policy per target (based on how each product is delivered, not on its language):
+#   distributed-python-based-product         -> "Standard Bundle Distribution"
+#   nondistributed-javascript-based-product  -> "Website/Hosted Service"
+# These are the defaults in the matrix below. Override them with repo variables if needed.
+#
 # Setup (once):
 #   Secret   FOSSA_API_KEY           full-access key for the diligence org (Settings > Secrets and variables > Actions)
 #   Variable FOSSA_RELEASE_GROUP     optional, existing release group name, e.g. "StepToes AI Diligence"
 #   Variable FOSSA_RELEASE           optional, release within that group, e.g. "2026-10-baseline"
-#   Variable FOSSA_POLICY_DISTRIBUTED / FOSSA_POLICY_HOSTED   optional, existing FOSSA policy names
+#   Variable FOSSA_POLICY_DISTRIBUTED / FOSSA_POLICY_HOSTED   optional overrides of the default policy names
 #   Variable FOSSA_TEAM              optional, existing FOSSA team, e.g. "M&A - StepToes AI"
-# Empty variables are skipped, so the workflow runs before any of them exist.
+# Empty optional variables are skipped. Policy names must match an existing FOSSA policy exactly.
 
 name: FOSSA diligence scan
 
@@ -50,18 +55,21 @@ jobs:
             title: "StepToes AI - Distributed (Python)"
             label: distributed
             policy_var: FOSSA_POLICY_DISTRIBUTED
+            policy_default: "Standard Bundle Distribution"   # shipped to customers as packages/files
           - dir: nondistributed-javascript-based-product
             project: steptoes-nondistributed-js
             title: "StepToes AI - Non-distributed (JavaScript)"
             label: non-distributed
             policy_var: FOSSA_POLICY_HOSTED
+            policy_default: "Website/Hosted Service"         # runs behind a server; watch for AGPL
     env:
       FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
       DIR: ${{ matrix.dir }}
       PROJECT: ${{ matrix.project }}
       BRANCH: ${{ github.head_ref || github.ref_name }}
       REV: ${{ github.sha }}
-      POLICY: ${{ vars[matrix.policy_var] }}
+      # Repo variable wins if set; otherwise the per-target default. Never falls back to the org default.
+      POLICY: ${{ vars[matrix.policy_var] || matrix.policy_default }}
       TEAM: ${{ vars.FOSSA_TEAM }}
       RELEASE_GROUP: ${{ vars.FOSSA_RELEASE_GROUP }}
       RELEASE: ${{ vars.FOSSA_RELEASE }}
@@ -81,6 +89,7 @@ jobs:
             exit 1
           fi
           mkdir -p "$OUT"
+          echo "Licensing policy for $PROJECT: $POLICY"
 
       - name: Install FOSSA CLI
         run: |
@@ -102,9 +111,9 @@ jobs:
             --title "${{ matrix.title }}"
             --project-label "${{ matrix.label }}"
             --project-label m-and-a
+            --policy "$POLICY"
             --json
           )
-          [ -n "$POLICY" ] && args+=(--policy "$POLICY")
           [ -n "$TEAM" ] && args+=(--team "$TEAM")
           if [ -n "$RELEASE_GROUP" ] && [ -n "$RELEASE" ]; then
             args+=(--release-group-name "$RELEASE_GROUP" --release-group-release "$RELEASE")
@@ -148,7 +157,7 @@ jobs:
             echo "| Directory | \`$DIR\` |"
             echo "| FOSSA project | \`$PROJECT\` |"
             echo "| Revision | \`${REV:0:7}\` on \`$BRANCH\` |"
-            echo "| Policy | ${POLICY:-org default} |"
+            echo "| Licensing policy | $POLICY |"
             echo "| Analyze | ${{ steps.analyze.outcome }} |"
             echo "| Policy test | ${{ steps.test.outcome }} (enforce: $ENFORCE) |"
             echo "| Reports | ${{ steps.reports.outcome }} |"
