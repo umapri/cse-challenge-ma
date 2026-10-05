@@ -1,4 +1,4 @@
-# .github/workflows/fossa.yml
+# Adding line1. .github/workflows/fossa.yml
 # FOSSA scan for the FlipFlop x StepToes AI M&A diligence (fossas/cse-challenge-ma).
 # One FOSSA project per product directory, as the brief requires (`fossa analyze <dir> --project <name>`).
 #
